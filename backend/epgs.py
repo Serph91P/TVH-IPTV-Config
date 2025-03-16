@@ -4,74 +4,86 @@ import gzip
 import json
 import logging
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from mimetypes import guess_extension
+import asyncio
+import time
+import xml.etree.ElementTree as ET
+from functools import lru_cache
 from urllib.parse import quote
 
 import aiofiles
 import aiohttp
-import asyncio
-import time
-import xml.etree.ElementTree as ET
-from types import NoneType
-
 from bs4 import BeautifulSoup
 from quart.utils import run_sync
 from sqlalchemy.orm import joinedload
-from sqlalchemy import and_, delete, insert, select
+from sqlalchemy import and_, delete, insert, select, func
+
 from backend.channels import read_base46_image_string
-from backend.models import db, Session, Epg, Channel, EpgChannels, EpgChannelProgrammes
+from backend.models import Session, Epg, Channel, EpgChannels, EpgChannelProgrammes
 from backend.tvheadend.tvh_requests import get_tvh
 
 logger = logging.getLogger('tic.epgs')
 
+# Constants
+XML_CHUNK_SIZE = 8192
+REQUEST_TIMEOUT = 60  # seconds
+DOWNLOAD_CHUNK_SIZE = 8192
+MAX_CONCURRENT_REQUESTS = 10
+CACHE_TTL = 600  # seconds
+
 
 def generate_epg_channel_id(number, name):
-    # return f"{number}_{re.sub(r'[^a-zA-Z0-9]', '', name)}"
+    """Generate a standardized channel ID for EPG data."""
     return str(number)
 
 
 async def read_config_all_epgs(output_for_export=False):
+    """Read all EPG configurations."""
     return_list = []
     async with Session() as session:
-        async with session.begin():
-            query = await session.execute(select(Epg))
-            results = query.scalars().all()
-            for result in results:
-                if output_for_export:
-                    return_list.append({
-                        'enabled': result.enabled,
-                        'name':    result.name,
-                        'url':     result.url,
-                    })
-                    continue
+        query = select(Epg)
+        result = await session.execute(query)
+        epgs = result.scalars().all()
+        
+        for epg in epgs:
+            if output_for_export:
                 return_list.append({
-                    'id':      result.id,
-                    'enabled': result.enabled,
-                    'name':    result.name,
-                    'url':     result.url,
+                    'enabled': epg.enabled,
+                    'name': epg.name,
+                    'url': epg.url,
                 })
+                continue
+                
+            return_list.append({
+                'id': epg.id,
+                'enabled': epg.enabled,
+                'name': epg.name,
+                'url': epg.url,
+            })
+            
     return return_list
 
 
 async def read_config_one_epg(epg_id):
+    """Read a specific EPG configuration by ID."""
     return_item = {}
     async with Session() as session:
-        async with session.begin():
-            query = await session.execute(select(Epg).where(Epg.id == epg_id))
-            results = query.scalar_one_or_none()
-            if results:
-                return_item = {
-                    'id':      results.id,
-                    'enabled': results.enabled,
-                    'name':    results.name,
-                    'url':     results.url,
-                }
+        query = select(Epg).where(Epg.id == epg_id)
+        result = await session.execute(query)
+        epg = result.scalar_one_or_none()
+        
+        if epg:
+            return_item = {
+                'id': epg.id,
+                'enabled': epg.enabled,
+                'name': epg.name,
+                'url': epg.url,
+            }
+            
     return return_item
 
 
 async def add_new_epg(data):
+    """Add a new EPG configuration."""
     async with Session() as session:
         async with session.begin():
             epg = Epg(
@@ -79,516 +91,635 @@ async def add_new_epg(data):
                 name=data.get('name'),
                 url=data.get('url'),
             )
-            # This is a new entry. Add it to the session before commit
             session.add(epg)
 
 
 async def update_epg(epg_id, data):
+    """Update an existing EPG configuration."""
     async with Session() as session:
         async with session.begin():
-            result = await session.execute(select(Epg).where(Epg.id == epg_id))
+            query = select(Epg).where(Epg.id == epg_id)
+            result = await session.execute(query)
             epg = result.scalar_one()
+            
             epg.enabled = data.get('enabled')
             epg.name = data.get('name')
             epg.url = data.get('url')
 
 
 async def delete_epg(config, epg_id):
+    """Delete an EPG configuration and all related data."""
     async with Session() as session:
         async with session.begin():
             # Get all channel IDs for the given EPG
-            # noinspection DuplicatedCode
-            result = await session.execute(select(EpgChannels.id).where(EpgChannels.epg_id == epg_id))
+            result = await session.execute(
+                select(EpgChannels.id).where(EpgChannels.epg_id == epg_id)
+            )
             channel_ids = [row[0] for row in result.fetchall()]
+            
             if channel_ids:
-                # Delete all EpgChannelProgrammes where epg_channel_id is in the list of channel IDs
+                # Delete all related programmes
                 await session.execute(
-                    delete(EpgChannelProgrammes).where(EpgChannelProgrammes.epg_channel_id.in_(channel_ids)))
-                # Delete all EpgChannels where id is in the list of channel IDs
-                await session.execute(delete(EpgChannels).where(EpgChannels.id.in_(channel_ids)))
-            # Delete the Epg entry
+                    delete(EpgChannelProgrammes).where(
+                        EpgChannelProgrammes.epg_channel_id.in_(channel_ids)
+                    )
+                )
+                
+                # Delete all related channels
+                await session.execute(
+                    delete(EpgChannels).where(EpgChannels.id.in_(channel_ids))
+                )
+                
+            # Delete the EPG entry
             await session.execute(delete(Epg).where(Epg.id == epg_id))
 
-    # Remove cached copy of epg
+    # Remove cached files
     cache_files = [
         os.path.join(config.config_path, 'cache', 'epgs', f"{epg_id}.xml"),
         os.path.join(config.config_path, 'cache', 'epgs', f"{epg_id}.yml"),
     ]
-    for f in cache_files:
-        if os.path.isfile(f):
-            os.remove(f)
+    
+    for filepath in cache_files:
+        if os.path.isfile(filepath):
+            os.remove(filepath)
 
 
 async def clear_epg_channel_data(epg_id):
+    """Clear all channel data for an EPG without deleting the EPG itself."""
     async with Session() as session:
         async with session.begin():
             # Get all channel IDs for the given EPG
-            # noinspection DuplicatedCode
-            result = await session.execute(select(EpgChannels.id).where(EpgChannels.epg_id == epg_id))
+            result = await session.execute(
+                select(EpgChannels.id).where(EpgChannels.epg_id == epg_id)
+            )
             channel_ids = [row[0] for row in result.fetchall()]
+            
             if channel_ids:
-                # Delete all EpgChannelProgrammes where epg_channel_id is in the list of channel IDs
+                # Delete all related programmes
                 await session.execute(
-                    delete(EpgChannelProgrammes).where(EpgChannelProgrammes.epg_channel_id.in_(channel_ids)))
-                # Delete all EpgChannels where id is in the list of channel IDs
-                await session.execute(delete(EpgChannels).where(EpgChannels.id.in_(channel_ids)))
+                    delete(EpgChannelProgrammes).where(
+                        EpgChannelProgrammes.epg_channel_id.in_(channel_ids)
+                    )
+                )
+                
+                # Delete all related channels
+                await session.execute(
+                    delete(EpgChannels).where(EpgChannels.id.in_(channel_ids))
+                )
 
 
 async def download_xmltv_epg(url, output):
+    """Download an XMLTV EPG file from a URL."""
     logger.info("Downloading EPG from url - '%s'", url)
-    if not os.path.exists(os.path.dirname(output)):
-        os.makedirs(os.path.dirname(output))
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            response.raise_for_status()
-            async with aiofiles.open(output, 'wb') as f:
-                async for chunk in response.content.iter_chunked(8192):
-                    await f.write(chunk)
-    await try_unzip(output)
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    }
+    
+    # Use a timeout to prevent hanging downloads
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                response.raise_for_status()
+                
+                # Stream the response to file
+                async with aiofiles.open(output, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                        await f.write(chunk)
+                        
+        # Try to unzip the file if it's compressed
+        await try_unzip(output)
+        return True
+        
+    except aiohttp.ClientError as e:
+        logger.error("Error downloading EPG: %s", str(e))
+        return False
+    except Exception as e:
+        logger.error("Unexpected error downloading EPG: %s", str(e))
+        return False
 
 
 async def try_unzip(output: str) -> None:
+    """Attempt to unzip a file if it's gzipped."""
     loop = asyncio.get_event_loop()
+    
     try:
-        with gzip.open(output, 'rb') as f:
-            out = f.readlines()
-        logger.info("Downloaded file is gzipped. Unzipping")
-        await loop.run_in_executor(None, lambda: open(output, 'wb').writelines(out))
-    except:
+        # Use run_in_executor for CPU-bound gzip operation
+        def _unzip():
+            with gzip.open(output, 'rb') as f:
+                content = f.read()
+            with open(output, 'wb') as f:
+                f.write(content)
+                
+        await loop.run_in_executor(None, _unzip)
+        logger.info("Downloaded file was gzipped. Successfully unzipped.")
+        
+    except Exception:
+        # Not a gzip file or other error, ignore
         pass
 
 
 async def store_epg_channels(config, epg_id):
+    """Parse and store EPG channel information from an XMLTV file."""
     xmltv_file = os.path.join(config.config_path, 'cache', 'epgs', f"{epg_id}.xml")
+    
     if not os.path.exists(xmltv_file):
-        logger.info("No such file '%s'", xmltv_file)
+        logger.error("No such file '%s'", xmltv_file)
         return False
-    # Read and parse XML file contents asynchronously
-    async with aiofiles.open(xmltv_file, mode='r', encoding="utf8", errors='ignore') as f:
-        contents = await f.read()
-    input_file = ET.ElementTree(ET.fromstring(contents))
-    async with Session() as session:
-        async with session.begin():
-            # Delete all existing EPG channels
-            stmt = delete(EpgChannels).where(EpgChannels.epg_id == epg_id)
-            await session.execute(stmt)
-            # Add an updated list of channels from the XML file to the DB
-            logger.info("Updating channels list for EPG #%s from path - '%s'", epg_id, xmltv_file)
-            items = []
-            channel_id_list = []
-            for channel in input_file.iterfind('.//channel'):
-                channel_id = channel.get('id')
-                display_name = channel.find('display-name').text
-                icon = ''
-                icon_elem = channel.find('icon')
-                if icon_elem is not None:
-                    icon = icon_elem.attrib.get('src', '')
-                logger.debug("Channel ID: '%s', Display Name: '%s', Icon: %s", channel_id, display_name, icon)
-                items.append({
-                    'epg_id':     epg_id,
-                    'channel_id': channel_id,
-                    'name':       display_name,
-                    'icon_url':   icon,
-                })
-                channel_id_list.append(channel_id)
-            # Perform bulk insert
-            await session.execute(insert(EpgChannels), items)
-            # Commit all updates to channels
-            await session.commit()
-            logger.info("Successfully imported %s channels from path - '%s'", len(channel_id_list), xmltv_file)
-        # Return list of channels
+    
+    # Read XML file contents
+    try:
+        async with aiofiles.open(xmltv_file, mode='r', encoding="utf8", errors='ignore') as f:
+            contents = await f.read()
+            
+        # Parse XML
+        input_file = ET.ElementTree(ET.fromstring(contents))
+        
+        # Process channels in database transaction
+        async with Session() as session:
+            async with session.begin():
+                # Delete existing EPG channels
+                await session.execute(
+                    delete(EpgChannels).where(EpgChannels.epg_id == epg_id)
+                )
+                
+                # Extract channel information
+                logger.info("Updating channels list for EPG #%s from path - '%s'", epg_id, xmltv_file)
+                items = []
+                channel_id_list = []
+                
+                # Process all channels
+                for channel in input_file.iterfind('.//channel'):
+                    channel_id = channel.get('id')
+                    display_name_elem = channel.find('display-name')
+                    
+                    if display_name_elem is None:
+                        logger.warning("Channel without display-name: %s", channel_id)
+                        continue
+                        
+                    display_name = display_name_elem.text
+                    
+                    # Extract icon URL if available
+                    icon = ''
+                    icon_elem = channel.find('icon')
+                    if icon_elem is not None:
+                        icon = icon_elem.attrib.get('src', '')
+                    
+                    logger.debug("Channel ID: '%s', Display Name: '%s', Icon: %s", 
+                                channel_id, display_name, icon)
+                    
+                    items.append({
+                        'epg_id': epg_id,
+                        'channel_id': channel_id,
+                        'name': display_name,
+                        'icon_url': icon,
+                    })
+                    channel_id_list.append(channel_id)
+                
+                # Bulk insert all channels
+                if items:
+                    await session.execute(insert(EpgChannels), items)
+                
+                logger.info("Successfully imported %s channels from path - '%s'", 
+                           len(channel_id_list), xmltv_file)
+                
         return channel_id_list
+        
+    except ET.ParseError as e:
+        logger.error("XML parsing error in file %s: %s", xmltv_file, str(e))
+        return False
+    except Exception as e:
+        logger.error("Error processing EPG channels from %s: %s", xmltv_file, str(e))
+        return False
 
 
 async def store_epg_programmes(config, epg_id, channel_id_list):
+    """Parse and store EPG programme information from an XMLTV file."""
     xmltv_file = os.path.join(config.config_path, 'cache', 'epgs', f"{epg_id}.xml")
+    
     if not os.path.exists(xmltv_file):
-        # TODO: Add error logging here
-        logger.info("No such file '%s'", xmltv_file)
+        logger.error("No such file '%s'", xmltv_file)
         return False
 
     def parse_and_save_programmes():
-        # Open file
-        input_file = ET.parse(xmltv_file)
-
-        # For each channel, create a list of programmes
-        logger.info("Fetching list of channels from EPG #%s from database", epg_id)
-        channel_ids = {}
-        for channel_id in channel_id_list:
-            epg_channel = db.session.query(EpgChannels) \
-                .filter(and_(EpgChannels.channel_id == channel_id,
-                             EpgChannels.epg_id == epg_id
-                             )) \
-                .first()
-            channel_ids[channel_id] = epg_channel.id
-        # Add an updated list of programmes from the XML file to the DB
-        logger.info("Updating new programmes list for EPG #%s from path - '%s'", epg_id, xmltv_file)
-        items = []
-        for programme in input_file.iterfind(".//programme"):
-            if len(items) > 1000:
-                db.session.bulk_save_objects(items, update_changed_only=False)
-                items = []
-            channel_id = programme.attrib.get('channel', None)
-            if channel_id in channel_ids:
-                epg_channel_id = channel_ids.get(channel_id)
-                # Parse attributes first
-                start = programme.attrib.get('start', None)
-                stop = programme.attrib.get('stop', None)
-                start_timestamp = programme.attrib.get('start_timestamp', None)
-                stop_timestamp = programme.attrib.get('stop_timestamp', None)
-                # Parse sub-elements
-                title = programme.findtext("title", default=None)
-                sub_title = programme.findtext("sub-title", default=None)
-                desc = programme.findtext("desc", default=None)
-                series_desc = programme.findtext("series-desc", default=None)
-                country = programme.findtext("country", default=None)
-                # Import icon
-                icon = programme.find("icon")
-                icon_url = icon.attrib.get('src', None) if icon is not None else None
-                # Import categories
-                categories = []
-                for category in programme.findall("category"):
-                    categories.append(category.text)
-                # TODO: Import rating
-                # TODO: Import star rating
-                # Create new line entry for the programmes table
-                items.append(
-                    EpgChannelProgrammes(
-                        epg_channel_id=epg_channel_id,
-                        channel_id=channel_id,
-                        title=title,
-                        sub_title=sub_title,
-                        desc=desc,
-                        series_desc=series_desc,
-                        icon_url=icon_url,
-                        country=country,
-                        start=start,
-                        stop=stop,
-                        start_timestamp=start_timestamp,
-                        stop_timestamp=stop_timestamp,
-                        categories=json.dumps(categories)
+        """Parse XML file and save programmes to database."""
+        try:
+            # Parse XML file
+            input_file = ET.parse(xmltv_file)
+            
+            # Build a mapping of channel IDs to EPG channel IDs
+            logger.info("Fetching list of channels from EPG #%s from database", epg_id)
+            from backend.models import db
+            
+            channel_ids = {}
+            for channel_id in channel_id_list:
+                epg_channel = db.session.query(EpgChannels) \
+                    .filter(and_(EpgChannels.channel_id == channel_id,
+                                EpgChannels.epg_id == epg_id
+                                )) \
+                    .first()
+                if epg_channel:
+                    channel_ids[channel_id] = epg_channel.id
+            
+            # Process all programmes
+            logger.info("Updating programmes list for EPG #%s from path - '%s'", epg_id, xmltv_file)
+            items = []
+            count = 0
+            
+            # Process programmes in batches for better memory efficiency
+            batch_size = 1000
+            for programme in input_file.iterfind(".//programme"):
+                if len(items) >= batch_size:
+                    db.session.bulk_save_objects(items, update_changed_only=False)
+                    db.session.commit()
+                    count += len(items)
+                    items = []
+                
+                channel_id = programme.attrib.get('channel', None)
+                if channel_id in channel_ids:
+                    epg_channel_id = channel_ids.get(channel_id)
+                    
+                    # Parse attributes
+                    start = programme.attrib.get('start', None)
+                    stop = programme.attrib.get('stop', None)
+                    start_timestamp = programme.attrib.get('start_timestamp', None)
+                    stop_timestamp = programme.attrib.get('stop_timestamp', None)
+                    
+                    # Parse elements
+                    title = programme.findtext("title", default=None)
+                    sub_title = programme.findtext("sub-title", default=None)
+                    desc = programme.findtext("desc", default=None)
+                    series_desc = programme.findtext("series-desc", default=None)
+                    country = programme.findtext("country", default=None)
+                    
+                    # Parse icon
+                    icon = programme.find("icon")
+                    icon_url = icon.attrib.get('src', None) if icon is not None else None
+                    
+                    # Parse categories
+                    categories = []
+                    for category in programme.findall("category"):
+                        if category.text:
+                            categories.append(category.text)
+                    
+                    # Create programme record
+                    items.append(
+                        EpgChannelProgrammes(
+                            epg_channel_id=epg_channel_id,
+                            channel_id=channel_id,
+                            title=title,
+                            sub_title=sub_title,
+                            desc=desc,
+                            series_desc=series_desc,
+                            icon_url=icon_url,
+                            country=country,
+                            start=start,
+                            stop=stop,
+                            start_timestamp=start_timestamp,
+                            stop_timestamp=stop_timestamp,
+                            categories=json.dumps(categories)
+                        )
                     )
-                )
-        logger.info("Saving new programmes list for EPG #%s from path - '%s'", epg_id, xmltv_file)
-        # Save remaining
-        db.session.bulk_save_objects(items, update_changed_only=False)
-        # Commit all updates to channel programmes
-        db.session.commit()
-        logger.info("Successfully imported %s programmes from path - '%s'", len(items), xmltv_file)
+            
+            # Save any remaining items
+            if items:
+                db.session.bulk_save_objects(items, update_changed_only=False)
+                db.session.commit()
+                count += len(items)
+            
+            logger.info("Successfully imported %s programmes from path - '%s'", count, xmltv_file)
+            return True
+            
+        except ET.ParseError as e:
+            logger.error("XML parsing error in file %s: %s", xmltv_file, str(e))
+            return False
+        except Exception as e:
+            logger.error("Error processing EPG programmes from %s: %s", xmltv_file, str(e))
+            return False
 
-    await run_sync(parse_and_save_programmes)()
-
-
-async def import_epg_data(config, epg_id):
-    epg = await read_config_one_epg(epg_id)
-    # Download a new local copy of the EPG
-    logger.info("Downloading updated XMLTV file for EPG #%s from url - '%s'", epg_id, epg['url'])
-    start_time = time.time()
-    xmltv_file = os.path.join(config.config_path, 'cache', 'epgs', f"{epg_id}.xml")
-    await download_xmltv_epg(epg['url'], xmltv_file)
-    execution_time = time.time() - start_time
-    logger.info("Updated XMLTV file for EPG #%s was downloaded in '%s' seconds", epg_id, int(execution_time))
-    # Read and save EPG data to DB
-    logger.info("Importing updated data for EPG #%s", epg_id)
-    start_time = time.time()
-    await clear_epg_channel_data(epg_id)
-    channel_id_list = await store_epg_channels(config, epg_id)
-    await store_epg_programmes(config, epg_id, channel_id_list)
-    execution_time = time.time() - start_time
-    logger.info("Updated data for EPG #%s was imported in '%s' seconds", epg_id, int(execution_time))
+    # Run the parsing function synchronously since it's CPU-bound
+    return await run_sync(parse_and_save_programmes)()
 
 
-async def import_epg_data_for_all_epgs(config):
-    for epg in db.session.query(Epg).all():
-        await import_epg_data(config, epg.id)
-
-
-async def read_channels_from_all_epgs(config):
-    epgs_channels = {}
-    for result in db.session.query(Epg).options(joinedload(Epg.epg_channels)).all():
-        epgs_channels[result.id] = []
-        for epg_channel in result.epg_channels:
-            epgs_channels[result.id].append({
-                "channel_id":   epg_channel.channel_id,
-                "display_name": epg_channel.name,
-                "icon":         epg_channel.icon_url,
+async def load_epg_channel_options(epg_id):
+    """Load channel options for a specific EPG."""
+    async with Session() as session:
+        query = select(EpgChannels).where(EpgChannels.epg_id == epg_id)
+        result = await session.execute(query)
+        channels = result.scalars().all()
+        
+        return_list = []
+        for channel in channels:
+            return_list.append({
+                'id': channel.id,
+                'channel_id': channel.channel_id,
+                'name': channel.name,
+                'icon_url': channel.icon_url,
             })
-    return epgs_channels
+            
+        return return_list
 
 
-# --- Cache ---
+@lru_cache(maxsize=128)
+def get_program_short_description(description, max_length=100):
+    """Extract a short description from a full program description, with caching."""
+    if not description:
+        return ""
+        
+    # Extract first sentence or limit by max_length
+    sentences = description.split('.')
+    if sentences:
+        short_desc = sentences[0].strip()
+        if len(short_desc) > max_length:
+            return short_desc[:max_length] + "..."
+        return short_desc
+    return ""
+
+
 async def build_custom_epg(config):
-    loop = asyncio.get_event_loop()
-    settings = config.read_settings()
-    logger.info("Generating custom EPG for TVH based on configured channels.")
-    start_time = time.time()
-    # Create the root <tv> element of the output XMLTV file
-    output_root = ET.Element('tv')
-    # Set the attributes for the output root element
-    output_root.set('generator-info-name', 'TVH-IPTV-Config')
-    output_root.set('source-info-name', 'TVH-IPTV-Config - v0.1')
-    # Read programmes from cached source EPG
-    configured_channels = []
-    all_channel_programmes_data = []
-    # for key in settings.get('channels', {}):
-    logger.info("   - Building a programme data for each channel.")
-    for result in db.session.query(Channel).order_by(Channel.number.asc()).all():
-        if result.enabled:
-            channel_id = generate_epg_channel_id(result.number, result.name)
-            # Read cached image
-            image_data, mime_type = await read_base46_image_string(result.logo_base64)
-            cache_buster = time.time()
-            ext = guess_extension(mime_type)
-            logo_url = f"{settings['settings']['app_url']}/tic-api/channels/{result.id}/logo/{cache_buster}{ext}"
-            # Populate a channels list
-            configured_channels.append({
-                'channel_id':   channel_id,
-                'display_name': result.name,
-                'logo_url':     logo_url,
-            })
-            db_programmes_query = db.session.query(EpgChannelProgrammes) \
-                .options(joinedload(EpgChannelProgrammes.channel)) \
-                .filter(and_(EpgChannelProgrammes.channel.has(epg_id=result.guide_id),
-                             EpgChannelProgrammes.channel.has(channel_id=result.guide_channel_id)
-                             )) \
-                .order_by(EpgChannelProgrammes.channel_id.asc(), EpgChannelProgrammes.start.asc())
-            # logger.debug(db_programmes_query)
-            db_programmes = db_programmes_query.all()
-            programmes = []
-            logger.info("       - Building programme list for %s - %s.", channel_id, result.name)
-            for programme in db_programmes:
-                programmes.append({
-                    'start':           programme.start,
-                    'stop':            programme.stop,
-                    'start_timestamp': programme.start_timestamp,
-                    'stop_timestamp':  programme.stop_timestamp,
-                    'title':           programme.title,
-                    'sub-title':       programme.sub_title,
-                    'desc':            programme.desc,
-                    'series-desc':     programme.series_desc,
-                    'country':         programme.country,
-                    'icon_url':        programme.icon_url,
-                    'categories':      json.loads(programme.categories)
-                })
-            all_channel_programmes_data.append({
-                'channel':    channel_id,
-                'tags':       [tag.name for tag in result.tags],
-                'programmes': programmes
-            })
-        await asyncio.sleep(.1)
-    # Loop over all configured channels
-    logger.info("   - Generating XML channel info.")
-    for channel_info in configured_channels:
-        # Create a <channel> element for a TV channel
-        channel = ET.SubElement(output_root, 'channel')
-        channel.set('id', str(channel_info['channel_id']))
-        # Add a <display-name> element to the <channel> element
-        display_name = ET.SubElement(channel, 'display-name')
-        display_name.text = channel_info['display_name'].strip()
-        # Add a <icon> element to the <channel> element
-        icon = ET.SubElement(channel, 'icon')
-        icon.set('src', channel_info['logo_url'])
-        # Add a <live> element to the <channel> element
-        live = ET.SubElement(channel, 'live')
-        live.text = 'true'
-        # Add a <active> element to the <channel> element
-        active = ET.SubElement(channel, 'active')
-        active.text = 'true'
-        await asyncio.sleep(.1)
-    # Loop through all <programme> elements returned
-    logger.info("   - Generating XML channel programme data.")
-    for channel_programmes_data in all_channel_programmes_data:
-        for epg_channel_programme in channel_programmes_data.get('programmes', []):
-            # Create a <programme> element for the output file and copy the attributes from the input programme
-            output_programme = ET.SubElement(output_root, 'programme')
-            # Build programmes from DB data (manually create attributes etc.
-            if epg_channel_programme['start']:
-                output_programme.set('start', epg_channel_programme['start'])
-            if epg_channel_programme['stop']:
-                output_programme.set('stop', epg_channel_programme['stop'])
-            if epg_channel_programme['start_timestamp']:
-                output_programme.set('start_timestamp', epg_channel_programme['start_timestamp'])
-            if epg_channel_programme['stop_timestamp']:
-                output_programme.set('stop_timestamp', epg_channel_programme['stop_timestamp'])
-            # Set the "channel" ident here
-            output_programme.set('channel', str(channel_programmes_data.get('channel')))
-            # Loop through all child elements of the input programme and copy them to the output programme
-            for child in ['title', 'sub-title', 'desc', 'series-desc', 'country']:
-                # Copy all other child elements to the output programme if they exist
-                if child in epg_channel_programme and epg_channel_programme[child] is not None:
-                    output_child = ET.SubElement(output_programme, child)
-                    output_child.text = epg_channel_programme[child]
-            # If we have a programme icon, add it
-            if epg_channel_programme['icon_url']:
-                output_child = ET.SubElement(output_programme, 'icon')
-                output_child.set('src', epg_channel_programme['icon_url'])
-                output_child.set('height', "")
-                output_child.set('width', "")
-            # Loop through all categories for this programme and add them as "category" child elements
-            if epg_channel_programme['categories']:
-                for category in epg_channel_programme['categories']:
-                    output_child = ET.SubElement(output_programme, 'category')
-                    output_child.text = category
-                    output_child.set('lang', 'en')
-            # Loop through all tags for this channel and add them as "category" child elements
-            for tag in channel_programmes_data.get('tags', []):
-                output_child = ET.SubElement(output_programme, 'category')
-                output_child.text = tag
-                output_child.set('lang', 'en')
-        await asyncio.sleep(.1)
-    # Create an XML file and write the output root element to it
-    logger.info("   - Writing out XMLTV file.")
-    output_tree = ET.ElementTree(output_root)
-    ET.indent(output_tree, space="\t", level=0)
-    custom_epg_file = os.path.join(config.config_path, "epg.xml")
-    await loop.run_in_executor(None, output_tree.write, custom_epg_file, 'UTF-8', True)
-    execution_time = time.time() - start_time
-    logger.info("The custom XMLTV EPG file for TVH was generated in '%s' seconds", int(execution_time))
+    """Build a custom EPG XML file from the database."""
+    logger.info("Creating static XMLTV EPG file")
+
+    # Ensure cache directory exists
+    output_dir = os.path.join(config.config_path)
+    epg_file = os.path.join(output_dir, "epg.xml")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Open file for writing
+    async with aiofiles.open(epg_file, 'w', encoding='utf-8') as f:
+        # Write XML header
+        await f.write('<?xml version="1.0" encoding="utf-8" ?>\n')
+        await f.write('<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
+        await f.write('<tv generator-info-name="TVH-IPTV-Config" generator-info-url="https://github.com/josh5/TVH-IPTV-Config">\n')
+
+        # Fetch all enabled channels with their sources and guide information
+        async with Session() as session:
+            # Query channels with eager loading of related data
+            query = select(Channel).options(
+                joinedload(Channel.guide)
+            ).filter(Channel.enabled == True)
+            
+            result = await session.execute(query)
+            channels = result.unique().scalars().all()
+
+            # Process all channels
+            for channel in channels:
+                # Generate channel ID
+                channel_id = generate_epg_channel_id(channel.number, channel.name)
+                
+                # Write channel element
+                await f.write(f'  <channel id="{channel_id}">\n')
+                await f.write(f'    <display-name>{channel.name}</display-name>\n')
+                
+                if channel.logo_url:
+                    await f.write(f'    <icon src="{channel.logo_url}"/>\n')
+                    
+                await f.write('  </channel>\n')
+
+            # Process programmes for all channels
+            for channel in channels:
+                if not channel.guide_id or not channel.guide_channel_id:
+                    continue
+                    
+                channel_id = generate_epg_channel_id(channel.number, channel.name)
+                
+                # Query programmes for this channel
+                programmes_query = select(EpgChannelProgrammes).join(
+                    EpgChannels, 
+                    EpgChannelProgrammes.epg_channel_id == EpgChannels.id
+                ).filter(
+                    EpgChannels.epg_id == channel.guide_id,
+                    EpgChannelProgrammes.channel_id == channel.guide_channel_id
+                )
+                
+                programmes_result = await session.execute(programmes_query)
+                programmes = programmes_result.scalars().all()
+                
+                # Write programme elements
+                for programme in programmes:
+                    await f.write(f'  <programme start="{programme.start}" stop="{programme.stop}" channel="{channel_id}">\n')
+                    
+                    if programme.title:
+                        await f.write(f'    <title>{programme.title}</title>\n')
+                        
+                    if programme.sub_title:
+                        await f.write(f'    <sub-title>{programme.sub_title}</sub-title>\n')
+                        
+                    if programme.desc:
+                        await f.write(f'    <desc>{programme.desc}</desc>\n')
+                        
+                    if programme.icon_url:
+                        await f.write(f'    <icon src="{programme.icon_url}"/>\n')
+                        
+                    if programme.categories:
+                        try:
+                            categories = json.loads(programme.categories)
+                            for category in categories:
+                                await f.write(f'    <category>{category}</category>\n')
+                        except (json.JSONDecodeError, TypeError):
+                            # Handle invalid JSON
+                            pass
+                            
+                    await f.write('  </programme>\n')
+
+        # Close the TV tag
+        await f.write('</tv>\n')
+
+    logger.info("Completed static XMLTV EPG file - %s", epg_file)
+    return epg_file
 
 
-# --- Online Metadata ---
-async def search_tmdb_for_movie(api_key, title, cache, lock, semaphore):
-    async with semaphore:
-        async with lock:
-            if 'tmdb' not in cache:
-                cache['tmdb'] = {}
-            if title in cache['tmdb']:
-                logger.debug("       - Fetching data for program '%s' from TMDB. [CACHED]", title)
-                return cache['tmdb'][title]
-        search_url = f'https://api.themoviedb.org/3/search/movie?api_key={api_key}&query={title}'
+async def run_tvh_epg_grabbers(config):
+    """Trigger TVHeadend EPG grabbers to update programme information."""
+    logger.info("Triggering an update in TVH to fetch the latest EPG")
+    
+    try:
+        async with await get_tvh(config) as tvh:
+            await tvh.trigger_epg_grabbers()
+            return True
+    except Exception as e:
+        logger.error("Failed to trigger EPG grabbers: %s", str(e))
+        return False
+
+
+async def fetch_tmdb_movie_info(title, api_key):
+    """Fetch movie information from TMDB API."""
+    if not api_key:
+        return None
+        
+    encoded_title = quote(title)
+    url = f"https://api.themoviedb.org/3/search/movie?api_key={api_key}&query={encoded_title}"
+    
+    try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(search_url) as response:
+            async with session.get(url) as response:
                 if response.status == 200:
-                    results = (await response.json()).get('results', [])
-                    if results:
-                        async with lock:
-                            cache['tmdb'][title] = results[0]  # Cache the first search result
-                        logger.debug("       - Fetching data for program '%s' from TMDB. [FETCHED]", title)
-                        return results[0]
-        async with lock:
-            cache['tmdb'][title] = None  # Cache None if no results found
-        logger.debug("       - Fetching data for program '%s' from TMDB. [NONE]", title)
+                    data = await response.json()
+                    if data.get('results') and len(data['results']) > 0:
+                        movie = data['results'][0]
+                        poster_path = movie.get('poster_path')
+                        if poster_path:
+                            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+                            return {
+                                'title': movie.get('title'),
+                                'overview': movie.get('overview'),
+                                'poster_url': poster_url,
+                                'release_date': movie.get('release_date'),
+                            }
+        return None
+    except Exception as e:
+        logger.error("Error fetching TMDB data: %s", str(e))
         return None
 
 
-async def search_google_images(title, cache, lock, semaphore):
-    async with semaphore:
-        async with lock:
-            if 'google_images' not in cache:
-                cache['google_images'] = {}
-            if title in cache['google_images']:
-                logger.debug("       - Fetching data for program '%s' from Google Images. [CACHED]", title)
-                return cache['google_images'][title]
-
-        search_query = f'"{title}" television show'
-        encoded_query = quote(search_query)
-        search_url = f'https://www.google.com/search?tbm=isch&safe=active&tbs=isz:m&q={encoded_query}'
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-        }
+async def google_image_search(query):
+    """Search for images using Google's image search."""
+    # Add movie/TV show keywords to improve results
+    search_query = f"{query} movie tv show poster official"
+    encoded_query = quote(search_query)
+    url = f"https://www.google.com/search?q={encoded_query}&tbm=isch"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, headers=headers) as response:
+            async with session.get(url, headers=headers) as response:
                 if response.status == 200:
-                    soup = BeautifulSoup(await response.text(), 'html.parser')
-                    images = soup.find_all('img')
-                    if images:
-                        # The first image might be the Google logo, so we take the second one
-                        image_url = images[1]['src']
-                        async with lock:
-                            cache['google_images'][title] = image_url  # Cache the first image URL
-                        logger.debug("       - Fetching data for program '%s' from Google Images. [FETCHED]", title)
-                        return image_url
-
-        async with lock:
-            cache['google_images'][title] = None  # Cache None if no results found
-        logger.debug("       - Fetching data for program '%s' from Google Images. [NONE]", title)
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # Look for image results
+                    img_tags = soup.find_all('img')
+                    img_urls = []
+                    
+                    for img in img_tags[1:10]:  # Skip first (usually Google logo) and limit results
+                        src = img.get('src')
+                        if src and src.startswith('http') and 'gstatic' not in src:
+                            img_urls.append(src)
+                            
+                    return img_urls[0] if img_urls else None
+        return None
+    except Exception as e:
+        logger.error("Error performing Google image search: %s", str(e))
         return None
 
 
-async def update_programme_with_online_data(settings, programme, categories, cache, lock, semaphore):
-    updated = False
-    title = programme.title
-    categories = [category.lower() for category in categories]
-
-    # Fetch updated data from TMDB
-    if not (programme.sub_title or programme.desc or programme.icon_url):
-        if settings['settings'].get('epgs', {}).get('enable_tmdb_metadata'):
-            api_key = settings['settings'].get('epgs', {}).get('tmdb_api_key', '')
-            tmdb_data = await search_tmdb_for_movie(api_key, title, cache, lock, semaphore)
-            if tmdb_data:
-                # Update programme with fetched data if fields are missing
-                if not programme.sub_title:
-                    programme.sub_title = tmdb_data.get('title')
-                if not programme.desc:
-                    programme.desc = tmdb_data.get('overview')
-                if not programme.icon_url:
-                    programme.icon_url = f"https://image.tmdb.org/t/p/w500{tmdb_data.get('poster_path')}"
-
-    # Fetch icon_url from Google Images if still missing
-    if not programme.icon_url:
-        if settings['settings'].get('epgs', {}).get('enable_google_image_search_metadata'):
-            image_url = await search_google_images(title, cache, lock, semaphore)
-            if image_url:
-                programme.icon_url = image_url
-
-    return programme
-
-
-async def update_programmes_concurrently(settings, programmes, cache, lock):
-    semaphore = asyncio.Semaphore(10)
-
-    async def update_wrapper(programme):
-        categories = json.loads(programme.categories)
-        return await update_programme_with_online_data(settings, programme, categories, cache, lock, semaphore)
-
-    tasks = [update_wrapper(programme) for programme in programmes]
-    updated_programmes = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(updated_programmes):
-        if isinstance(result, Exception):
-            logger.error(f"Error updating programme: {result}")
-        else:
-            programmes[i] = result
-
-    return programmes
+async def update_programme_with_metadata(programme, settings):
+    """Update a programme with metadata from external sources."""
+    try:
+        # Check if we should update TMDB metadata
+        if settings.get('enable_tmdb_metadata') and programme.title:
+            api_key = settings.get('tmdb_api_key')
+            movie_info = await fetch_tmdb_movie_info(programme.title, api_key)
+            
+            if movie_info:
+                if not programme.desc and movie_info.get('overview'):
+                    programme.desc = movie_info['overview']
+                if not programme.icon_url and movie_info.get('poster_url'):
+                    programme.icon_url = movie_info['poster_url']
+                    
+        # Check if we should update with Google image search
+        if settings.get('enable_google_image_search_metadata') and programme.title and not programme.icon_url:
+            img_url = await google_image_search(programme.title)
+            if img_url:
+                programme.icon_url = img_url
+                
+        return programme
+    except Exception as e:
+        logger.error("Error updating programme: %s", str(e))
+        return programme
 
 
 async def update_channel_epg_with_online_data(config):
-    settings = config.read_settings()
-    update_with_online_data = False
-    if settings['settings'].get('epgs', {}).get('enable_tmdb_metadata'):
-        update_with_online_data = True
-    if settings['settings'].get('epgs', {}).get('enable_google_image_search_metadata'):
-        update_with_online_data = True
-    if not update_with_online_data:
-        return
-    start_time = time.time()
-    cache = {}
-    lock = asyncio.Lock()
+    """Update EPG data with online metadata for all channels."""
     logger.info("Update EPG with missing data from online sources for each configured channel.")
-    for result in db.session.query(Channel).order_by(Channel.number.asc()).all():
-        if result.enabled:
-            channel_id = generate_epg_channel_id(result.number, result.name)
-            db_programmes_query = db.session.query(EpgChannelProgrammes) \
-                .options(joinedload(EpgChannelProgrammes.channel)) \
-                .filter(and_(EpgChannelProgrammes.channel.has(epg_id=result.guide_id),
-                             EpgChannelProgrammes.channel.has(channel_id=result.guide_channel_id)
-                             )) \
-                .order_by(EpgChannelProgrammes.channel_id.asc(), EpgChannelProgrammes.start.asc())
-            db_programmes = db_programmes_query.all()
-            logger.info("   - Updating programme list for %s - %s.", channel_id, result.name)
-            programmes = await update_programmes_concurrently(settings, db_programmes, cache, lock)
-            # Save all new
-            db.session.bulk_save_objects(programmes)
-            # Commit all updates to channel programmes
-            db.session.commit()
-    execution_time = time.time() - start_time
-    logger.info("Updating online EPG data for configured channels took '%s' seconds", int(execution_time))
+    
+    settings = config.read_settings()
+    epg_settings = settings['settings'].get('epgs', {})
+    
+    # Skip if no metadata sources are enabled
+    if not (epg_settings.get('enable_tmdb_metadata') or epg_settings.get('enable_google_image_search_metadata')):
+        logger.info("No metadata sources enabled. Skipping EPG update.")
+        return
+        
+    # Get all channels with EPG data
+    async with Session() as session:
+        channels_query = select(Channel).filter(
+            Channel.guide_id.isnot(None),
+            Channel.guide_channel_id.isnot(None)
+        )
+        
+        channels_result = await session.execute(channels_query)
+        channels = channels_result.scalars().all()
+        
+        # Process each channel's programmes
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        
+        for channel in channels:
+            logger.info("   - Updating programme list for %s - %s.", channel.number, channel.name)
+            
+            # Get programmes for this channel
+            programmes_query = select(EpgChannelProgrammes).join(
+                EpgChannels,
+                EpgChannelProgrammes.epg_channel_id == EpgChannels.id
+            ).filter(
+                EpgChannels.epg_id == channel.guide_id,
+                EpgChannelProgrammes.channel_id == channel.guide_channel_id
+            )
+            
+            programmes_result = await session.execute(programmes_query)
+            programmes = programmes_result.scalars().all()
+            
+            # Process programmes with concurrency limit
+            update_tasks = []
+            
+            async def process_programme(prog):
+                async with semaphore:
+                    try:
+                        updated_prog = await update_programme_with_metadata(prog, epg_settings)
+                        return updated_prog
+                    except Exception as e:
+                        logger.error("Error updating programme: %s", str(e))
+                        return prog
+            
+            for programme in programmes:
+                update_tasks.append(process_programme(programme))
+                
+            # Wait for all updates to complete
+            updated_programmes = await asyncio.gather(*update_tasks, return_exceptions=True)
+            
+            # Filter out exceptions and save updated programmes
+            valid_programmes = [p for p in updated_programmes if not isinstance(p, Exception)]
+            
+            for programme in valid_programmes:
+                session.add(programme)
+                
+            await session.commit()
 
 
-# --- TVH Functions ---
-async def run_tvh_epg_grabbers(config):
-    # Trigger a re-grab of the EPG in TVH
-    async with await get_tvh(config) as tvh:
-        await tvh.run_internal_epg_grabber()
+async def delete_epg_programme_data(config, epg_id, epg_channel_id, programme_id=None):
+    """Delete programme data for an EPG channel."""
+    async with Session() as session:
+        async with session.begin():
+            if programme_id:
+                # Delete a single programme
+                await session.execute(
+                    delete(EpgChannelProgrammes).where(
+                        EpgChannelProgrammes.id == programme_id
+                    )
+                )
+            else:
+                # Delete all programmes for the channel
+                await session.execute(
+                    delete(EpgChannelProgrammes).where(
+                        EpgChannelProgrammes.epg_channel_id == epg_channel_id
+                    )
+                )
+
