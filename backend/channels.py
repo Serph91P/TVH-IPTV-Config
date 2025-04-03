@@ -453,9 +453,15 @@ async def add_bulk_channels(config, data):
         # Auto assign the channel number to the next available number
         new_channel_data['number'] = int(channel_number)
         
-        # Add the group title as a tag if it exists
+        # Add the group title as a tag if it exists - ensure it's properly handled
         if playlist_stream.group_title and playlist_stream.group_title.strip():
-            new_channel_data['tags'].append(playlist_stream.group_title.strip())
+            group_name = playlist_stream.group_title.strip()
+            new_channel_data['tags'].append(group_name)
+            # Check if this tag already exists, if not create it
+            channel_tag = db.session.query(ChannelTag).filter(ChannelTag.name == group_name).one_or_none()
+            if not channel_tag:
+                channel_tag = ChannelTag(name=group_name)
+                db.session.add(channel_tag)
         
         # Find the best match for an EPG
         epg_match = db.session.query(EpgChannels).filter(EpgChannels.channel_id == playlist_stream.tvg_id).first()
