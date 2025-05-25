@@ -237,21 +237,141 @@ async def store_epg_programmes(config, epg_id, channel_id_list):
                 stop = programme.attrib.get('stop', None)
                 start_timestamp = programme.attrib.get('start_timestamp', None)
                 stop_timestamp = programme.attrib.get('stop_timestamp', None)
-                # Parse sub-elements
+                
+                # Parse basic sub-elements
                 title = programme.findtext("title", default=None)
                 sub_title = programme.findtext("sub-title", default=None)
                 desc = programme.findtext("desc", default=None)
                 series_desc = programme.findtext("series-desc", default=None)
                 country = programme.findtext("country", default=None)
-                # Import icon
+                url = programme.findtext("url", default=None)
+                date = programme.findtext("date", default=None)
+                
+                # Parse icon
                 icon = programme.find("icon")
                 icon_url = icon.attrib.get('src', None) if icon is not None else None
-                # Import categories
+                
+                # Parse categories
                 categories = []
                 for category in programme.findall("category"):
-                    categories.append(category.text)
-                # TODO: Import rating
-                # TODO: Import star rating
+                    if category.text:
+                        categories.append(category.text)
+                
+                # Parse keywords
+                keywords = []
+                for keyword in programme.findall("keyword"):
+                    if keyword.text:
+                        keywords.append(keyword.text)
+                
+                # Parse credits
+                credits_data = {}
+                credits_elem = programme.find("credits")
+                if credits_elem is not None:
+                    for credit_type in ['actor', 'director', 'writer', 'producer', 'presenter', 'commentator', 'guest']:
+                        credit_list = []
+                        for credit in credits_elem.findall(credit_type):
+                            if credit.text:
+                                credit_list.append(credit.text)
+                        if credit_list:
+                            credits_data[credit_type] = credit_list
+                
+                # Parse episode number
+                episode_num_system = None
+                episode_num_value = None
+                episode_num = programme.find("episode-num")
+                if episode_num is not None:
+                    episode_num_system = episode_num.attrib.get('system', None)
+                    episode_num_value = episode_num.text
+                
+                # Parse rating
+                rating_system = None
+                rating_value = None
+                rating = programme.find("rating")
+                if rating is not None:
+                    rating_system = rating.attrib.get('system', None)
+                    rating_value_elem = rating.find("value")
+                    if rating_value_elem is not None:
+                        rating_value = rating_value_elem.text
+                
+                # Parse star rating
+                star_rating = None
+                star_rating_elem = programme.find("star-rating")
+                if star_rating_elem is not None:
+                    star_rating_value = star_rating_elem.find("value")
+                    if star_rating_value is not None:
+                        star_rating = star_rating_value.text
+                
+                # Parse video information
+                video_present = None
+                video_colour = None
+                video_aspect = None
+                video_quality = None
+                video = programme.find("video")
+                if video is not None:
+                    video_present_elem = video.find("present")
+                    if video_present_elem is not None:
+                        video_present = video_present_elem.text.lower() == 'yes'
+                    
+                    video_colour_elem = video.find("colour")
+                    if video_colour_elem is not None:
+                        video_colour = video_colour_elem.text.lower() == 'yes'
+                    
+                    video_aspect_elem = video.find("aspect")
+                    if video_aspect_elem is not None:
+                        video_aspect = video_aspect_elem.text
+                    
+                    video_quality_elem = video.find("quality")
+                    if video_quality_elem is not None:
+                        video_quality = video_quality_elem.text
+                
+                # Parse audio information
+                audio_present = None
+                audio_stereo = None
+                audio = programme.find("audio")
+                if audio is not None:
+                    audio_present_elem = audio.find("present")
+                    if audio_present_elem is not None:
+                        audio_present = audio_present_elem.text.lower() == 'yes'
+                    
+                    audio_stereo_elem = audio.find("stereo")
+                    if audio_stereo_elem is not None:
+                        audio_stereo = audio_stereo_elem.text
+                
+                # Parse accessibility features
+                subtitles_type = None
+                subtitles = programme.find("subtitles")
+                if subtitles is not None:
+                    subtitles_type = subtitles.attrib.get('type', None)
+                
+                audio_described = None
+                if programme.find("audio-described") is not None:
+                    audio_described = True
+                
+                # Parse programme flags
+                is_premiere = programme.find("premiere") is not None
+                is_new = programme.find("new") is not None
+                
+                # Parse previously shown
+                previously_shown = None
+                previously_shown_elem = programme.find("previously-shown")
+                if previously_shown_elem is not None:
+                    previously_shown = previously_shown_elem.attrib.get('start', None)
+                
+                # Parse length
+                length = None
+                length_elem = programme.find("length")
+                if length_elem is not None:
+                    length_units = length_elem.attrib.get('units', 'minutes')
+                    length = f"{length_elem.text} {length_units}" if length_elem.text else None
+                
+                # Parse review
+                review_type = None
+                review_value = None
+                review = programme.find("review")
+                if review is not None:
+                    review_type = review.attrib.get('type', None)
+                    review_value = review.text
+                
                 # Create new line entry for the programmes table
                 items.append(
                     EpgChannelProgrammes(
@@ -267,7 +387,30 @@ async def store_epg_programmes(config, epg_id, channel_id_list):
                         stop=stop,
                         start_timestamp=start_timestamp,
                         stop_timestamp=stop_timestamp,
-                        categories=json.dumps(categories)
+                        categories=json.dumps(categories) if categories else None,
+                        url=url,
+                        date=date,
+                        length=length,
+                        keywords=json.dumps(keywords) if keywords else None,
+                        credits=json.dumps(credits_data) if credits_data else None,
+                        episode_num_system=episode_num_system,
+                        episode_num_value=episode_num_value,
+                        rating_system=rating_system,
+                        rating_value=rating_value,
+                        star_rating=star_rating,
+                        video_present=video_present,
+                        video_colour=video_colour,
+                        video_aspect=video_aspect,
+                        video_quality=video_quality,
+                        audio_present=audio_present,
+                        audio_stereo=audio_stereo,
+                        subtitles_type=subtitles_type,
+                        audio_described=audio_described,
+                        is_premiere=is_premiere,
+                        is_new=is_new,
+                        previously_shown=previously_shown,
+                        review_type=review_type,
+                        review_value=review_value
                     )
                 )
         logger.info("Saving new programmes list for EPG #%s from path - '%s'", epg_id, xmltv_file)
@@ -358,7 +501,7 @@ async def build_custom_epg(config):
             programmes = []
             logger.info("       - Building programme list for %s - %s.", channel_id, result.name)
             for programme in db_programmes:
-                programmes.append({
+                programme_data = {
                     'start':           programme.start,
                     'stop':            programme.stop,
                     'start_timestamp': programme.start_timestamp,
@@ -369,8 +512,32 @@ async def build_custom_epg(config):
                     'series-desc':     programme.series_desc,
                     'country':         programme.country,
                     'icon_url':        programme.icon_url,
-                    'categories':      json.loads(programme.categories)
-                })
+                    'categories':      json.loads(programme.categories) if programme.categories else [],
+                    'url':             programme.url,
+                    'date':            programme.date,
+                    'length':          programme.length,
+                    'keywords':        json.loads(programme.keywords) if programme.keywords else [],
+                    'credits':         json.loads(programme.credits) if programme.credits else {},
+                    'episode_num_system': programme.episode_num_system,
+                    'episode_num_value':  programme.episode_num_value,
+                    'rating_system':   programme.rating_system,
+                    'rating_value':    programme.rating_value,
+                    'star_rating':     programme.star_rating,
+                    'video_present':   programme.video_present,
+                    'video_colour':    programme.video_colour,
+                    'video_aspect':    programme.video_aspect,
+                    'video_quality':   programme.video_quality,
+                    'audio_present':   programme.audio_present,
+                    'audio_stereo':    programme.audio_stereo,
+                    'subtitles_type':  programme.subtitles_type,
+                    'audio_described': programme.audio_described,
+                    'is_premiere':     programme.is_premiere,
+                    'is_new':          programme.is_new,
+                    'previously_shown': programme.previously_shown,
+                    'review_type':     programme.review_type,
+                    'review_value':    programme.review_value
+                }
+                programmes.append(programme_data)
             all_channel_programmes_data.append({
                 'channel':    channel_id,
                 'tags':       [tag.name for tag in result.tags],
@@ -419,12 +586,129 @@ async def build_custom_epg(config):
                 if child in epg_channel_programme and epg_channel_programme[child] is not None:
                     output_child = ET.SubElement(output_programme, child)
                     output_child.text = epg_channel_programme[child]
+            
+            # Add URL if available
+            if epg_channel_programme.get('url'):
+                output_child = ET.SubElement(output_programme, 'url')
+                output_child.text = epg_channel_programme['url']
+            
+            # Add date if available
+            if epg_channel_programme.get('date'):
+                output_child = ET.SubElement(output_programme, 'date')
+                output_child.text = epg_channel_programme['date']
+            
+            # Add length if available
+            if epg_channel_programme.get('length'):
+                output_child = ET.SubElement(output_programme, 'length')
+                if ' ' in epg_channel_programme['length']:
+                    length_parts = epg_channel_programme['length'].split(' ', 1)
+                    output_child.text = length_parts[0]
+                    if len(length_parts) > 1:
+                        output_child.set('units', length_parts[1])
+                else:
+                    output_child.text = epg_channel_programme['length']
+                    output_child.set('units', 'minutes')
+            
+            # Add credits if available
+            if epg_channel_programme.get('credits'):
+                credits_elem = ET.SubElement(output_programme, 'credits')
+                for credit_type, credit_list in epg_channel_programme['credits'].items():
+                    for credit_name in credit_list:
+                        credit_elem = ET.SubElement(credits_elem, credit_type)
+                        credit_elem.text = credit_name
+            
+            # Add episode number if available
+            if epg_channel_programme.get('episode_num_system') and epg_channel_programme.get('episode_num_value'):
+                episode_elem = ET.SubElement(output_programme, 'episode-num')
+                episode_elem.set('system', epg_channel_programme['episode_num_system'])
+                episode_elem.text = epg_channel_programme['episode_num_value']
+            
+            # Add rating if available
+            if epg_channel_programme.get('rating_system') and epg_channel_programme.get('rating_value'):
+                rating_elem = ET.SubElement(output_programme, 'rating')
+                rating_elem.set('system', epg_channel_programme['rating_system'])
+                value_elem = ET.SubElement(rating_elem, 'value')
+                value_elem.text = epg_channel_programme['rating_value']
+            
+            # Add star rating if available
+            if epg_channel_programme.get('star_rating'):
+                star_rating_elem = ET.SubElement(output_programme, 'star-rating')
+                value_elem = ET.SubElement(star_rating_elem, 'value')
+                value_elem.text = epg_channel_programme['star_rating']
+            
+            # Add video information if available
+            video_info = {}
+            if epg_channel_programme.get('video_present') is not None:
+                video_info['present'] = 'yes' if epg_channel_programme['video_present'] else 'no'
+            if epg_channel_programme.get('video_colour') is not None:
+                video_info['colour'] = 'yes' if epg_channel_programme['video_colour'] else 'no'
+            if epg_channel_programme.get('video_aspect'):
+                video_info['aspect'] = epg_channel_programme['video_aspect']
+            if epg_channel_programme.get('video_quality'):
+                video_info['quality'] = epg_channel_programme['video_quality']
+            
+            if video_info:
+                video_elem = ET.SubElement(output_programme, 'video')
+                for key, value in video_info.items():
+                    child_elem = ET.SubElement(video_elem, key)
+                    child_elem.text = value
+            
+            # Add audio information if available
+            audio_info = {}
+            if epg_channel_programme.get('audio_present') is not None:
+                audio_info['present'] = 'yes' if epg_channel_programme['audio_present'] else 'no'
+            if epg_channel_programme.get('audio_stereo'):
+                audio_info['stereo'] = epg_channel_programme['audio_stereo']
+            
+            if audio_info:
+                audio_elem = ET.SubElement(output_programme, 'audio')
+                for key, value in audio_info.items():
+                    child_elem = ET.SubElement(audio_elem, key)
+                    child_elem.text = value
+            
+            # Add subtitles if available
+            if epg_channel_programme.get('subtitles_type'):
+                subtitles_elem = ET.SubElement(output_programme, 'subtitles')
+                subtitles_elem.set('type', epg_channel_programme['subtitles_type'])
+            
+            # Add audio description if available
+            if epg_channel_programme.get('audio_described'):
+                ET.SubElement(output_programme, 'audio-described')
+            
+            # Add premiere flag if available
+            if epg_channel_programme.get('is_premiere'):
+                ET.SubElement(output_programme, 'premiere')
+            
+            # Add new flag if available
+            if epg_channel_programme.get('is_new'):
+                ET.SubElement(output_programme, 'new')
+            
+            # Add previously shown if available
+            if epg_channel_programme.get('previously_shown'):
+                prev_elem = ET.SubElement(output_programme, 'previously-shown')
+                prev_elem.set('start', epg_channel_programme['previously_shown'])
+            
+            # Add review if available
+            if epg_channel_programme.get('review_value'):
+                review_elem = ET.SubElement(output_programme, 'review')
+                if epg_channel_programme.get('review_type'):
+                    review_elem.set('type', epg_channel_programme['review_type'])
+                review_elem.text = epg_channel_programme['review_value']
+            
             # If we have a programme icon, add it
             if epg_channel_programme['icon_url']:
                 output_child = ET.SubElement(output_programme, 'icon')
                 output_child.set('src', epg_channel_programme['icon_url'])
                 output_child.set('height', "")
                 output_child.set('width', "")
+            
+            # Add keywords
+            if epg_channel_programme.get('keywords'):
+                for keyword in epg_channel_programme['keywords']:
+                    keyword_elem = ET.SubElement(output_programme, 'keyword')
+                    keyword_elem.text = keyword
+                    keyword_elem.set('lang', 'en')
+            
             # Loop through all categories for this programme and add them as "category" child elements
             if epg_channel_programme['categories']:
                 for category in epg_channel_programme['categories']:
